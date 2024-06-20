@@ -1,17 +1,20 @@
-import std/[posix, epoll, oserrors, sets]
+import std/epoll
 
+const includeUnixCommons {.used.} = true
+include ./unixcommons
+
+#[ *** compile flags *** ]#
 
 const IoPoolSize* {.intdefine.} = 0
 
-
 type
-  AsyncFd = distinct FileHandle
-
-  Event {.pure.} = enum
-    Read, Write
-
   Selector = object
     epollFd: FileHandle
+    wakeUpEvent: UserEvent
+    lock: Lock
+    isWaiting: Atomic[bool]
+    registeredReadHandles: Table[FileHandle, Channel[ptr IoOperation]]
+    registeredWriteHandles: Table[FileHandle, Channel[ptr IoOperation]]
     readReadyList: HashSet[FileHandle]
     writeReadyList: HashSet[FileHandle]
 
@@ -31,24 +34,30 @@ proc toEpollEvent(events: set[Event]): uint32 =
     result = result or EPOLLOUT
 
 
-proc newAsyncFd(fd: FileHandle): AsyncFd =
-  ## AsyncFd will become non blocking
-  if fcntl(fd, F_SETFD, O_NONBLOCK) == -1:
-    raiseOsError(osLastError())
-  return AsyncFd(fd)
-
-proc closeAsyncFd(fd: AsyncFd) =
-  if close(fd.cint) == -1:
-    raiseOsError(osLastError())
 
 
-proc newSelector(): Selector =
-  Selector(epollFd: epoll_create1(0))
+
+
 
 proc registerHandle(selector: var Selector, fd: AsyncFd, events: set[Event]) =
   var epv = EpollEvent(events: toEpollEvent(events))
   if epoll_ctl(selector.epollFd, EPOLL_CTL_ADD, fd.cint, addr epv) != 0:
     raiseOsError(osLastError())
+
+proc registerEvent(selector: var Selector, userEvent: UserEvent) =
+  var epv = EpollEvent(events: EPOLLET or EPOLLIN or EPOLLOUT)
+  if epoll_ctl(selector.epollFd, EPOLL_CTL_ADD, userEvent.fd.cint, addr epv) != 0:
+    raiseOsError(osLastError())
+
+proc newSelector(): Selector =
+  var lock: Lock
+  initLock(lock)
+  result = Selector(
+    epollFd: epoll_create1(0),
+    wakeUpEvent: newUserEvent(),
+    lock: lock
+    )
+  registerEvent(result, result.wakeUpEvent)
 
 proc select(selector: var Selector, timeoutMs: int): int =
   var epvTable: array[MaxEpollEvents, EpollEvent]
