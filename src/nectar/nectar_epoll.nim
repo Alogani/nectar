@@ -16,12 +16,10 @@ type
     isWaiting: Atomic[bool]
     wakeUpEvent: UserEvent
     # Interactions
-    lock: Lock
-    registeredReadHandles: Table[FileHandle, Channel[ptr IoOperation]]
-    registeredWriteHandles: Table[FileHandle, Channel[ptr IoOperation]]
-    readReadyList: HashSet[FileHandle]
-    writeReadyList: HashSet[FileHandle]
+    readPoll: FdPolling
+    writePoll: FdPolling
     completed: Channel[ptr IoOperation]
+    cancelledCountStillInside: Atomic[int]
 
 
 const MaxEpollEvents = 64
@@ -33,26 +31,30 @@ setGlobalIoCompletion()
 
 
 proc toEpollEvent(events: set[Event]): uint32 =
-  result = EPOLLET or EPOLLRDHUP
+  result = EPOLLET# or EPOLLRDHUP
   if Event.Read in events:
     result = result or EPOLLIN
   if Event.Write in events:
     result = result or EPOLLOUT
 
-
-proc registerHandle(fd: AsyncFd, events: set[Event]) =
-  var epv = EpollEvent(events: toEpollEvent(events))
-  if epoll_ctl(GlobalIoCompletion[].selectorFd, EPOLL_CTL_ADD, fd.cint, addr epv) != 0:
+proc registerHandle*(fd: AsyncFd, events: set[Event]) =
+  var epv = EpollEvent(events: toEpollEvent(events), data: EpollData(fd: fd.cint))
+  if epoll_ctl(GlobalIoCompletion[].selectorFd, EPOLL_CTL_ADD, epv.data.fd, addr epv) != 0:
     raiseOsError(osLastError())
+  if events.card > 0 and events != { Event.Write }:
+    GlobalIoCompletion[].readPoll.addFd(FileHandle(fd))
+  if Event.Write in events:
+    GlobalIoCompletion[].writePoll.addFd(FileHandle(fd))
 
-proc registerEvent(userEvent: UserEvent) =
-  var epv = EpollEvent(events: EPOLLET or EPOLLIN or EPOLLOUT)
-  if epoll_ctl(GlobalIoCompletion[].selectorFd, EPOLL_CTL_ADD, userEvent.fd.cint, addr epv) != 0:
+proc unregister*(fd: AsyncFd) =
+  discard
+
+proc registerEvent*(userEvent: UserEvent) =
+  var epv = EpollEvent(events: EPOLLET or EPOLLIN or EPOLLOUT, data: EpollData(fd: userEvent.fd.cint))
+  if epoll_ctl(GlobalIoCompletion[].selectorFd, EPOLL_CTL_ADD, epv.data.fd, addr epv) != 0:
     raiseOsError(osLastError())
 
 proc setGlobalIoCompletion(maxThreads = getMaxThreads()) =
-  var lock: Lock
-  initLock(lock)
   var completedChan: Channel[ptr IoOperation]
   open(completedChan)
   let wakeUpEvent = newUserEvent()
@@ -61,25 +63,42 @@ proc setGlobalIoCompletion(maxThreads = getMaxThreads()) =
     maxThreads: maxThreads,
     selectorFd: epoll_create1(0),
     wakeUpEvent: wakeUpEvent,
-    lock: lock,
+    readPoll: initFdPolling(),
+    writePoll: initFdPolling(),
     completed: completedChan
     )
-  registerEvent(wakeUpEvent)
+  registerEvent(GlobalIoCompletion[].wakeUpEvent)
 
-proc poll(timeoutMs: int): int =
-  var epvTable: array[MaxEpollEvents, EpollEvent]
-  let count = epoll_wait(GlobalIoCompletion[].selectorFd, addr epvTable[0], MaxEpollEvents, timeoutMs.cint)
+proc destroyGlobalIoCompletion*() =
+  if close(GlobalIoCompletion[].selectorFd) == -1:
+    raiseOsError(osLastError()) 
+  close(GlobalIoCompletion[].wakeUpEvent)
+  deinit(GlobalIoCompletion[].readPoll)
+  deinit(GlobalIoCompletion[].writePoll)
+  close(GlobalIoCompletion[].completed)
+  dealloc(GlobalIoCompletion)
+
+proc poll(timeoutMs: int): bool =
+  ## return true if there are new pending fd
+  var readyFdList: array[MaxEpollEvents, EpollEvent]
+  if timeoutMs == -1:
+    GlobalIoCompletion[].isWaiting.store(true)
+  let count = epoll_wait(GlobalIoCompletion[].selectorFd, addr readyFdList[0], MaxEpollEvents, timeoutMs.cint)
+  if timeoutMs == -1:
+    GlobalIoCompletion[].isWaiting.store(false)
   if count == -1:
     raiseOsError(osLastError())
-  for epv in epvTable:
-    let epvEvents = epv.events.int
-    if (epvEvents and EPOLLERR) != 0:
+  for i in 0..<count:
+    let readyKey = readyFdList[i]
+    if readyKey.data.fd == GlobalIoCompletion[].wakeUpEvent.fd:
+      continue
+    let readyKeyEvents = readyKey.events.int
+    if (readyKeyEvents and EPOLLERR) != 0:
       raiseOsError(osLastError()) # TODO: https://github.com/nim-lang/Nim/blob/646bd99d461469f08e656f92ae278d6695b35778/lib/pure/ioselects/ioselectors_epoll.nim#L400
-    if (epvEvents and EPOLLIN) != 0:
-      GlobalIoCompletion[].readReadyList.incl(epv.data.fd)
-    if (epvEvents and EPOLLOUT) != 0:
-      GlobalIoCompletion[].writeReadyList.incl(epv.data.fd)
-  return count
+    if (readyKeyEvents and EPOLLIN) != 0:
+      result = result or setFdAsReady(GlobalIoCompletion[].readPoll, readyKey.data.fd)
+    if (readyKeyEvents and EPOLLOUT) != 0:
+      result = result or setFdAsReady(GlobalIoCompletion[].writePoll, readyKey.data.fd)
 
 
 #[ *** Loop *** ]#
@@ -95,8 +114,32 @@ proc processTimers(): int =
       return -1
   return (GlobalIoCompletion[].timers[0].finishAt - monoTimeNow).inMilliseconds()
 
+proc processIoOperation() =
+  var exhaustedFd = false
+  for (fd, ioOpPtr) in pendingItems(GlobalIoCompletion[].readPoll, exhaustedFd):
+    read(fd, ioOpPtr, exhaustedFd)
+    GlobalIoCompletion[].completed.send(ioOpPtr)
+  for (fd, ioOpPtr) in pendingItems(GlobalIoCompletion[].writePoll, exhaustedFd):
+    write(fd, ioOpPtr, exhaustedFd)
+    GlobalIoCompletion[].completed.send(ioOpPtr)
+
 
 proc masterLoop() {.thread.} =
   while not GlobalIoCompletion[].stopFlag:
     let selectorTimeout = processTimers()
-    let readyCount = poll(selectorTimeout)
+    discard poll(selectorTimeout)
+    processIoOperation()
+
+proc getNextCompletedIoOperation*(): ptr IoOperation =
+  GlobalIoCompletion[].completed.recv()
+
+#[ *** AsyncIo *** ]#
+
+proc readFileAsync*(fd: AsyncFd, buffer: pointer, size: int, ioOpPtr: ptr IOOperation) =
+  ioOpPtr[].kind = Event.Read
+  ioOpPtr[].isFile = true
+  ioOpPtr[].buffer = buffer
+  ioOpPtr[].bytesRequested = size
+  if addIoOperation(GlobalIoCompletion[].readPoll, FileHandle(fd), ioOpPtr) and 
+        GlobalIoCompletion[].isWaiting.load():
+    GlobalIoCompletion[].wakeUpEvent.trigger()
