@@ -133,6 +133,7 @@ proc masterLoop() {.thread.} =
 proc getNextCompletedIoOperation*(): ptr IoOperation =
   GlobalIoCompletion[].completed.recv()
 
+
 #[ *** AsyncIo *** ]#
 
 proc readFileAsync*(fd: AsyncFd, buffer: pointer, size: int, ioOpPtr: ptr IOOperation) =
